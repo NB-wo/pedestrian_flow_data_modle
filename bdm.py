@@ -1,9 +1,10 @@
+import datetime
+import time
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
 import torch
 from torch import nn
 from tqdm import tqdm
-from gen_data import get_data_from_database
+from gen_data import delete_anomaly_from_database, get_data_from_database, get_latest_data_from_database
 
 
 def encode_cyclic_feature(data, max_val):
@@ -30,7 +31,7 @@ def preprocess_data(data):
     scaled_second_sin, scaled_second_cos = encode_cyclic_feature(data[:, 5], 60)
     
     # 对流量数据进行归一化
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler = RobustMinMaxScaler(feature_range=(0, 1))
     scaled_flow_counts = scaler.fit_transform(data[:, 6].reshape(-1, 1))
     
     # 合并所有经过处理的特征
@@ -60,6 +61,26 @@ def preprocess_data(data):
     
     # 返回处理后的数据
     return x_train_tensor, y_train_tensor
+
+class RobustMinMaxScaler:
+    def __init__(self):
+        self.min_ = None
+        self.max_ = None
+
+    def fit(self, data):
+        self.min_ = np.min(data)
+        self.max_ = np.max(data)
+
+    def transform(self, data):
+        # Ensure data is within the range of min_ and max_
+        data = np.clip(data, self.min_, self.max_)
+        
+        # Normalize data
+        return (data - self.min_) / (self.max_ - self.min_)
+
+    def fit_transform(self, data):
+        self.fit(data)
+        return self.transform(data)
 
 class LSTM(nn.Module):
     """
@@ -159,8 +180,8 @@ def train_model(data, model, optimizer, loss_function, epochs=300):
             optimizer.zero_grad()
             
             # 重置LSTM的隐藏状态和单元状态
-            model.hidden_cell = (torch.zeros(1, 1, model.hidden_layer_size),
-                                 torch.zeros(1, 1, model.hidden_layer_size))
+            #model.hidden_cell = (torch.zeros(1, 1, model.hidden_layer_size),
+            #                     torch.zeros(1, 1, model.hidden_layer_size))
             
             # 获取模型的预测结果
             y_pred = model(seq).view(-1)
@@ -225,15 +246,45 @@ def trigger_alert(predicted, actual, difference):
     print(f"Anomaly Detected! Predicted: {predicted}, Actual: {actual}, Difference: {difference}")
 
 if __name__ == "__main__":
-    data = get_data_from_database("localhost", "mysql", "123456", "flow_of_people")
-    
-    # 初始化模型、优化器和损失函数
+    # 初始设置
     model = LSTM()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_function = nn.MSELoss()
+    loss_function = torch.nn.MSELoss()
 
-    train_model(data, model, optimizer, loss_function, epochs=1)
-
-    # 初始预测
-    test_inputs = data[-1, :].tolist()
-    future_values = predict_future(model, test_inputs)
+    # 从数据库加载初始数据（处理时排除ID）
+    data = get_data_from_database(host="localhost", user="mysql", password="123456", database="flow_of_people")[:, 1:]
+    train_model(data, model, optimizer, loss_function, epochs=10)
+    
+    # 获取数据集中的最后一个日期（排除ID）
+    last_training_date = data[-1][0]
+    
+    while True:
+        # 从数据库获取最新数据
+        latest_data = get_latest_data_from_database(host="localhost", user="mysql", password="123456", database="flow_of_people")
+        
+        # 检查是否有新数据
+        if latest_data is not None:
+            # 存储ID，以备后续可能的异常删除
+            latest_data_id = latest_data[0]
+            # 提取日期
+            latest_data_date = datetime.date(latest_data[1], latest_data[2], latest_data[3])
+            # 处理数据，排除ID
+            latest_data_processed = np.array([latest_data[1:]])
+            
+            # 使用模型进行预测
+            prediction = predict_future(model, preprocess_data(latest_data_processed), future_predict=1)
+            
+            # 检查异常
+            anomaly = detect_anomaly(prediction, latest_data[-1])  # 假设最后一列是实际的计数
+            if anomaly:
+                # 从数据库中删除异常值
+                delete_anomaly_from_database(host="localhost", user="mysql", password="123456", database="flow_of_people", anomaly_id=latest_data_id)
+            
+            # 检查是否需要重新训练（每3天一次）
+            if (latest_data_date - last_training_date).days >= 3:
+                # 从数据库中重新获取数据，排除ID
+                data = get_data_from_database(host="localhost", user="mysql", password="123456", database="flow_of_people")[:, 1:]
+                train_model(data, model, optimizer, loss_function, epochs=10)
+                last_training_date = latest_data_date
+            else:
+                time.sleep(300)
