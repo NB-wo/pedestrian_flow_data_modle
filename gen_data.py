@@ -4,10 +4,14 @@ import datetime
 import random
 
 
+last_fetched_timestamp = None
+
 def get_latest_data_from_database(host, user, password, database):
     """
     从数据库获取最新的人流量数据。
     """
+    global last_fetched_timestamp
+
     cnx = mysql.connector.connect(
         host=host,
         user=user,
@@ -16,11 +20,13 @@ def get_latest_data_from_database(host, user, password, database):
     )
     cursor = cnx.cursor()
 
-    cursor.execute("SELECT id, timestamp, count FROM pedestrian_flow ORDER BY timestamp DESC LIMIT 1")
-    record = cursor.fetchone()
+    query = "SELECT id, timestamp, flow_count FROM flow_of_people WHERE timestamp > %s ORDER BY timestamp"
+    cursor.execute(query, (last_fetched_timestamp,))
+    records = cursor.fetchall()
     
-    if record:
-        data = [record[0], record[1].year, record[1].month, record[1].day, record[1].hour, record[1].minute, record[1].second, record[2]]
+    if records:
+        data = np.array([[record[0], record[1].year, record[1].month, record[1].day, record[1].hour, record[1].minute, record[1].second, record[2]] for record in records])
+        last_fetched_timestamp = records[-1][0]
     else:
         data = None
 
@@ -63,6 +69,9 @@ def get_data_from_database(host, user, password, database):
     一个二维数组，其中每一行包含年、月、日、小时、分钟、秒和对应的人流量。
     """
 
+    #获取数据库中的所有数据并设置last_fetched_timestamp为最新的时间戳。
+    global last_fetched_timestamp
+
     # 连接数据库
     cnx = mysql.connector.connect(
         host=host,
@@ -73,8 +82,9 @@ def get_data_from_database(host, user, password, database):
     cursor = cnx.cursor()
 
     # 查询pedestrian_flow表中的所有数据
-    cursor.execute("SELECT timestamp, count FROM pedestrian_flow ORDER BY timestamp")
+    cursor.execute("SELECT id, timestamp, count FROM pedestrian_flow ORDER BY timestamp")
     records = cursor.fetchall()
+    last_fetched_timestamp = records[-1][0]
 
     data = np.array([[record[0], record[1].year, record[1].month, record[1].day, record[1].hour, record[1].minute, record[1].second, record[2]] for record in records])
 
@@ -162,6 +172,84 @@ def main():
     cursor.close()
     cnx.close()
     
+
+def create_planned_events_table(host, user, password, database):
+    """ 
+    在数据库中创建'planned_events'表，如果它不存在的话。
+    """
+    cnx = mysql.connector.connect(
+        host=host,
+        user=user,
+        password=password,
+        database=database
+    )
+    cursor = cnx.cursor()
+
+    cursor.execute("SHOW TABLES LIKE 'planned_events'")
+    result = cursor.fetchone()
+
+    if not result:
+        cursor.execute("""
+            CREATE TABLE planned_events (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                event_date DATE NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                expected_count INT NOT NULL
+            )
+        """)
+
+    cursor.close()
+    cnx.close()
+
+
+def add_planned_event(host, user, password, database, event_date, start_time, end_time, expected_count):
+    """ 
+    向'planned_events'表中添加一个预定事件。
+    """
+    cnx = mysql.connector.connect(
+        host=host,
+        user=user,
+        password=password,
+        database=database
+    )
+    cursor = cnx.cursor()
+
+    cursor.execute("""
+        INSERT INTO planned_events (event_date, start_time, end_time, expected_count)
+        VALUES (%s, %s, %s, %s)
+    """, (event_date, start_time, end_time, expected_count))
+
+    cnx.commit()
+
+    cursor.close()
+    cnx.close()
+
+
+def get_planned_event(host, user, password, database, timestamp):
+    """ 
+    根据给定的时间戳从数据库中获取预定的事件。
+    """
+    cnx = mysql.connector.connect(
+        host=host,
+        user=user,
+        password=password,
+        database=database
+    )
+    cursor = cnx.cursor()
+
+    cursor.execute(
+        "SELECT expected_count FROM planned_events \
+        WHERE event_date = %s AND start_time <= %s AND end_time >= %s",
+        (timestamp.date(), timestamp.time(), timestamp.time())
+    )
+    record = cursor.fetchone()
+
+    cursor.close()
+    cnx.close()
+
+    return record[0] if record else None
+
 
 if __name__ == "__main__":
     main()
